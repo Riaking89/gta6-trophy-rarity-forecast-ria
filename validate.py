@@ -12,13 +12,21 @@
      B: the 103 fresh earns allocated proportional to r^2 (concentrated on
         early/high-rate trophies)
      C: fresh earns 0 for every trophy but the 100% one (y = 0.165*r)
-   These proxies encode the OLD (v1) prior. The v2 flat prior is instead
-   calibrated to the v1 entry's REAL practice grade (loss 0.174689,
-   typical miss 0.05 points, coverage 0.927273): see identify_flat_prior(),
-   which scans total fresh earns and concentration gamma against those
-   three numbers and identifies ~10 fresh earns, not 103. The proxies are
-   kept as a robustness check, not a target: v2 scores worse against A/B
-   (they assume the wrong total) and better against C, as expected.
+   These proxies encode the OLD (v1) prior. The flat prior is instead
+   calibrated to the v1 AND v2 entries' REAL practice grades (v1: loss
+   0.174689, typical miss 0.05 points, coverage 0.927273; v2: loss
+   0.168216, miss 0.05, coverage 0.890909): see identify_flat_prior(),
+   which scans total fresh earns AND concentration gamma jointly against
+   all six numbers and identifies gamma ~4 with total ~103 fresh earns.
+   The v2 identification of total ~10 was wrong: it held the shape fixed
+   at low gamma, where only the total can move. No smooth truth matches
+   all six numbers exactly (best joint fit still leaves the losses
+   0.01-0.03 high and coverage ~0.02 high) -- the realized counts are
+   lumpier than any smooth law. A Poisson-count-quantile flat branch was
+   tried in v3 and rejected (worst proxy 0.185, worse than v2's 0.181).
+   The proxies are kept as a robustness check, not a target, with explicit
+   bars: worst proxy must stay below v2's 0.181, and 90% coverage against
+   proxy C must stay near 0.90.
 4. Synthetic final backtest: a cohort-based launch-week generator (tracked
    players grow as a power law; each hourly cohort earns each trophy at a
    rate rising with its age; Exophase refreshes every ~5h and the page
@@ -224,13 +232,15 @@ def gamma_truth(case, gamma):
 
 
 def identify_flat_prior():
-    """Identify the flat prior from the v1 entry's REAL practice grade
-    (loss 0.174689, typical miss 0.05, coverage 0.927273): score the v1
-    flat forecast against gamma-law truths with different total fresh
-    earns, and find the total whose loss and miss match the server's.
-    Also scans concentration gamma at the old 103-earn anchor."""
-    print("\n=== FLAT-PRIOR IDENTIFICATION (real v1 grade: loss 0.174689,"
-          " miss 0.05, cov 0.927) ===")
+    """Identify the flat prior from the v1 AND v2 entries' REAL practice
+    grades (v1: loss 0.174689, miss 0.05, coverage 0.927273; v2: loss
+    0.168216, miss 0.05, coverage 0.890909): score both forecasts against
+    gamma-law truths, scanning total fresh earns AND concentration gamma
+    jointly, and rank candidates by error against all six numbers. The
+    v2-only scan (total at low gamma) misidentified the total as ~10;
+    the joint scan identifies gamma ~4 with total ~103."""
+    print("\n=== FLAT-PRIOR IDENTIFICATION (real grades: v1 loss 0.174689,"
+          " miss 0.05, cov 0.927; v2 loss 0.168216, miss 0.05, cov 0.891) ===")
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         ind, outd = td / "in", td / "out"
@@ -240,10 +250,16 @@ def identify_flat_prior():
             (ind / f).write_text((KIT / "input" / f).read_text())
         run_main(ind, outd, {"MF_FLAT_GAMMA": "0", "MF_FLAT_SPREAD": "0.25",
                               "MF_FRESH_EARNS_PER_NEW": str(103.0 / 3230.0)})
-        fc = []
+        fc1 = []
         for f in ("p00.in", "p01.in"):
             case = json.loads((KIT / "input" / f).read_text())
-            fc.append((case, json.loads((outd / (Path(f).stem + ".out")).read_text())))
+            fc1.append((case, json.loads((outd / (Path(f).stem + ".out")).read_text())))
+        run_main(ind, outd, {"MF_FLAT_GAMMA": "0.5", "MF_FLAT_SPREAD": "0.15",
+                              "MF_FRESH_EARNS_PER_NEW": str(10.0 / 3230.0)})
+        fc2 = []
+        for f in ("p00.in", "p01.in"):
+            case = json.loads((KIT / "input" / f).read_text())
+            fc2.append((case, json.loads((outd / (Path(f).stem + ".out")).read_text())))
 
     def stats(forecast, truth):
         rows = {r["id"]: r["q"] for r in forecast["trophies"]}
@@ -280,37 +296,47 @@ def identify_flat_prior():
                 out.append(100.0 * (e_old + e_new) / n_new)
         return out
 
-    print("v1 forecast vs gamma-law truths, total fresh earns scanned:")
-    for total in (0, 10, 25, 50, 103):
-        ls, ms, cs = [], [], []
-        for case, mine in fc:
-            l, m, c = stats(mine, truth_total(case, total))
-            ls.append(l)
-            ms.append(m)
-            cs.append(c)
-        print(f"  total {total:<4} -> loss {sum(ls)/2:.3f} miss {sum(ms)/2:.3f} "
-              f"cov {sum(cs)/2:.3f}")
-    print("==> loss 0.174689 and miss 0.05 both point at total ~= 10"
-          " (0 -> 0.192/0.050, 10 -> 0.174/0.046, 25 -> 0.148/0.039).")
-    print("v1 forecast vs gamma-law truths at the old 103-earn anchor:")
-    for gamma in (0.0, 0.5, 1.0, 1.5, 2.0, 3.0):
-        ls = [score(mine, gamma_truth(case, gamma)) for case, mine in fc]
-        print(f"  truth gamma {gamma:<4} -> v1 loss {sum(ls)/len(ls):.3f}")
-    print("==> no gamma at 103 earns reaches 0.1747 (max 0.141 at gamma 3);"
-          " the total, not the shape, was wrong.")
+    server = {"v1": (0.174689, 0.05, 0.927273), "v2": (0.168216, 0.05, 0.890909)}
+    results = []
+    for gamma in (0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0):
+        for total in (0, 10, 25, 50, 103, 150, 200):
+            err = 0.0
+            detail = {}
+            for name, fc, srv in (("v1", fc1, server["v1"]), ("v2", fc2, server["v2"])):
+                ls, ms, cs = [], [], []
+                for case, mine in fc:
+                    l, m, c = stats(mine, truth_total(case, total, gamma))
+                    ls.append(l)
+                    ms.append(m)
+                    cs.append(c)
+                L, M, C = sum(ls) / 2, sum(ms) / 2, sum(cs) / 2
+                detail[name] = (L, M, C)
+                err += abs(L - srv[0]) / 0.005 + abs(M - srv[1]) / 0.005 + abs(C - srv[2]) / 0.01
+            results.append((err, gamma, total, detail))
+    results.sort()
+    print("joint (gamma, total) scan, ranked by error vs all six server numbers:")
+    for err, gamma, total, d in results[:5]:
+        print(f"  gamma {gamma:<4} total {total:<4} err {err:6.2f} | v1 L {d['v1'][0]:.3f} M {d['v1'][1]:.3f} C {d['v1'][2]:.3f}"
+              f" | v2 L {d['v2'][0]:.3f} M {d['v2'][1]:.3f} C {d['v2'][2]:.3f}")
+    print("==> best joint fit is gamma ~4, total ~103 (the v1 total was"
+          " right; its uniform shape was wrong). No smooth truth matches"
+          " all six numbers: the realized counts are lumpier than any"
+          " smooth law, which is why v3 keeps a uniform 0.15 spread"
+          " instead of Poisson-count quantiles (tried, rejected: worst"
+          " proxy 0.185).")
 
 
 def flat_sweep():
     print("\n=== FLAT-BRANCH GAMMA SWEEP (practice proxies, mean p00+p01) ===")
     print("minimax = worst proxy; lower is better")
-    for gamma in (0.0, 0.5, 1.0):
+    for gamma in (3.0, 4.0, 5.0):
         m = practice_scores(gamma=gamma)
         worst = max(m.values())
         print(f"gamma {gamma:<4} " + "  ".join(f"{k.split()[0]} {v:.3f}" for k, v in m.items()) +
               f"  worst {worst:.3f}")
-    print("=== FLAT SPREAD (gamma 0.5) ===")
+    print("=== FLAT SPREAD (gamma 4.0) ===")
     for sp in (0.10, 0.15, 0.25):
-        m = practice_scores(gamma=0.5, flat_spread=sp)
+        m = practice_scores(gamma=4.0, flat_spread=sp)
         print(f"spread {sp:<5} " + "  ".join(f"{k.split()[0]} {v:.3f}" for k, v in m.items()) +
               f"  worst {max(m.values()):.3f}")
 
@@ -475,7 +501,7 @@ if __name__ == "__main__":
     mean_ex = sum(ex) / len(ex)
     assert abs(mean_ex - 0.403404) < 1e-6, f"scorer mismatch: {mean_ex}"
     print(f"scorer OK (worked example mean {mean_ex:.6f} == 0.403404)")
-    print("=== PRACTICE (p00 + p01) vs proxy answers, v2 defaults ===")
+    print("=== PRACTICE (p00 + p01) vs proxy answers, v3 defaults ===")
     print("house persistence baseline scores ~1.51 on the real practice")
     m = practice_scores()
     for k, v in m.items():

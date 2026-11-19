@@ -20,13 +20,15 @@ The program works from the case's history of reads:
   - when the history is flat (one snapshot: no refresh seen yet) it forecasts
     one refresh like the launch night's first: tracked players x6.06, the
     newly tracked players holding the ubiquitous trophy at 100% and the other
-    trophies at a fresh fraction that grows with the trophy's old rate
-    (fresh_frac ~ sqrt(rate): a new cohort reaches easy trophies far sooner
-    than hard ones), calibrated so the fresh earns total ~10 over 3,230 new
-    players, the number the v1 entry's real practice grade identifies (see
-    below); the spread is 0.15 logit, tightened from 0.25 after the real
-    practice grade showed 90% coverage of 0.927 (too wide) with a typical
-    miss of only 0.05 points;
+    trophies at a fresh fraction that grows steeply with the trophy's old
+    rate (fresh_frac ~ rate**4: a new cohort reaches easy trophies far
+    sooner than hard ones), calibrated so the fresh earns total ~103 over
+    3,230 new players, the number and shape the v1+v2 real practice grades
+    jointly identify (see below); the spread is 0.15 logit, tightened from
+    0.25 after the real practice grade showed 90% coverage of 0.927 (too
+    wide) with a typical miss of only 0.05 points, and kept at 0.15 in v3
+    because a tighter 0.10 collapses 90% coverage against the pure-dilution
+    proxy to 0.73;
   - when the history has real refreshes the median blends three components
     in logit space (weights 0.6 / 0.25 / 0.15): a logit-trend fit over the
     last 24 hours of snapshots (the house curve baseline's shape, fitted on
@@ -50,11 +52,13 @@ blend scores ~0.13 mean pinball loss there, against ~0.28 for the house
 curve baseline and ~0.39 for persistence. That is a synthetic result, not
 a promise about the real final. The v1 entry scored 0.174689 on the real
 practice (rank ~901 of 4,900 scored; top-20 cutoff 0.0492) with coverage
-0.927 and a typical miss of 0.05 points: the practice is one refresh over
-90 minutes and, as the rules warn, little guide to the final's week, but
-its three numbers identify the flat prior's fresh earns at ~10, not 103,
-which v2 uses. The final is decided on the refresh-branch forecast, not
-the flat prior.
+0.927 and a typical miss of 0.05 points, and v2 scored 0.168216 with
+coverage 0.891 and the same miss: the practice is one refresh over 90
+minutes and, as the rules warn, little guide to the final's week, but the
+two grades jointly identify the flat prior's shape (gamma ~4, total ~103
+fresh earns -- the v2 total of ~10 was a misidentification from holding
+the shape fixed). The final is decided on the refresh-branch forecast,
+not the flat prior, and the flat branch is the only part v3 changes.
 
 Output: /output/<id>.out, {"trophies": [{"id": n, "q": [q05, q25, q50, q75,
 q95]}]}, one row per trophy, quantiles non-decreasing in [0, 100], rounded
@@ -79,16 +83,27 @@ RELEASE = datetime(2026, 11, 19, 0, 0, 0, tzinfo=timezone.utc)
 
 # First refresh on launch night: 638 -> 3,868 tracked players (x6.06). The
 # newly tracked players held the ubiquitous trophy at 100% and earned only
-# ~10 trophies across the other 54 in the first hours: that number is not
-# assumed, it is identified from the v1 entry's real practice grade (loss
-# 0.174689, typical miss 0.05 points), which the 103-earn uniform prior
-# cannot reproduce (it predicts loss ~0.10 and miss ~0.00). The fresh
-# fraction grows with the trophy's old rate as fresh_frac = C * rate**0.5
+# ~103 trophies across the other 54 in the first hours. That total is not
+# assumed: the v1 entry's real practice grade (loss 0.174689, typical miss
+# 0.05 points, coverage 0.927) and the v2 entry's (loss 0.168216, miss 0.05,
+# coverage 0.891) jointly identify it, but only together with the SHAPE:
+# no low-gamma (spread-out) truth reproduces all six numbers -- the
+# low-gamma identification of v2 (total ~10) was wrong, because it held the
+# shape fixed. Scanning gamma and total jointly, the best fit is gamma ~4
+# (fresh earns concentrated on the easiest, highest-rate trophies) with
+# total ~103; the residual error (losses still 0.01-0.03 above the smooth
+# fit, coverage ~0.02 high) is the realized-count lumpiness no smooth law
+# captures. A Poisson-count-quantile flat branch was tried in v3 and
+# REJECTED: it gains little (expected practice loss 0.102 -> 0.090 in the
+# ideal case) and fails the robustness bar (worst practice proxy 0.185,
+# worse than v2's 0.181), because its collapsed quantiles on low-rate
+# trophies are too tight against a high-fresh-earns truth. The fresh
+# fraction grows with the trophy's old rate as fresh_frac = C * rate**4
 # (a new cohort reaches easy trophies far sooner than hard ones), with C
 # set so the fresh earns total FRESH_EARNS_PER_NEW per new player.
 FIRST_REFRESH_GROWTH = 6.06
 FRESH_EARNS_PER_NEW = float(
-    os.environ.get("MF_FRESH_EARNS_PER_NEW", str(10.0 / 3230.0)))
+    os.environ.get("MF_FRESH_EARNS_PER_NEW", str(103.0 / 3230.0)))
 
 # Blend weights of the three median components (logit space). Tuned on a
 # synthetic launch-week backtest (see README). The environment overrides
@@ -102,7 +117,7 @@ W_EN = float(os.environ.get("MF_W_EN", "0.15"))
 RESID_FLOOR = 0.30
 HORIZON_SIGMA = float(os.environ.get("MF_HORIZON_SIGMA", "0.15"))
 FLAT_SPREAD = float(os.environ.get("MF_FLAT_SPREAD", "0.15"))
-FLAT_GAMMA = float(os.environ.get("MF_FLAT_GAMMA", "0.5"))
+FLAT_GAMMA = float(os.environ.get("MF_FLAT_GAMMA", "4.0"))
 SPREAD_CAP = 2.0
 
 # Time shift (hours) in the saturating fits: the page already showed earned
