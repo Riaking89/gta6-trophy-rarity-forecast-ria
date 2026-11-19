@@ -6,12 +6,19 @@
    ln(1+hours), last 24h of reads).
 3. Practice sensitivity: the kit ships no practice answers, so the practice
    cases are scored against three proxy answers for the first refresh, all
-   consistent with the totals the rules state (N 638 -> 3,868; total earns
-   943 -> 4,276; the 100% trophy unchanged):
+   built on the v1 assumption (N 638 -> 3,868; total earns 943 -> 4,276;
+   103 fresh earns; the 100% trophy unchanged):
      A: new-cohort rate 6.7% of the old rate (uniform dilution, y ~ 0.221*r)
      B: the 103 fresh earns allocated proportional to r^2 (concentrated on
         early/high-rate trophies)
      C: fresh earns 0 for every trophy but the 100% one (y = 0.165*r)
+   These proxies encode the OLD (v1) prior. The v2 flat prior is instead
+   calibrated to the v1 entry's REAL practice grade (loss 0.174689,
+   typical miss 0.05 points, coverage 0.927273): see identify_flat_prior(),
+   which scans total fresh earns and concentration gamma against those
+   three numbers and identifies ~10 fresh earns, not 103. The proxies are
+   kept as a robustness check, not a target: v2 scores worse against A/B
+   (they assume the wrong total) and better against C, as expected.
 4. Synthetic final backtest: a cohort-based launch-week generator (tracked
    players grow as a power law; each hourly cohort earns each trophy at a
    rate rising with its age; Exophase refreshes every ~5h and the page
@@ -172,10 +179,14 @@ def proxy_answers(case):
     return out
 
 
-def practice_table():
-    print("=== PRACTICE (p00 + p01) vs proxy answers ===")
-    print("house persistence baseline scores ~1.51 on the real practice")
-    print(f"{'proxy':<24} {'mine':>7} {'persist':>7} {'curve':>7}")
+def practice_scores(gamma=None, flat_spread=None):
+    """Mean practice loss vs each proxy, over p00+p01. Returns {proxy: mean}."""
+    env = {}
+    if gamma is not None:
+        env["MF_FLAT_GAMMA"] = str(gamma)
+    if flat_spread is not None:
+        env["MF_FLAT_SPREAD"] = str(flat_spread)
+    tot = {}
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         ind, outd = td / "in", td / "out"
@@ -183,15 +194,125 @@ def practice_table():
         outd.mkdir()
         for f in ("p00.in", "p01.in"):
             (ind / f).write_text((KIT / "input" / f).read_text())
-        run_main(ind, outd)
+        run_main(ind, outd, env)
         for f in ("p00.in", "p01.in"):
             case = json.loads((KIT / "input" / f).read_text())
             mine = json.loads((outd / (Path(f).stem + ".out")).read_text())
-            pers = baseline_persistence(case)
-            curv = baseline_curve(case)
             for name, truth in proxy_answers(case).items():
-                print(f"{f} {name:<24} {score(mine, truth):7.3f} "
-                      f"{score(pers, truth):7.3f} {score(curv, truth):7.3f}")
+                tot.setdefault(name, []).append(score(mine, truth))
+    return {k: sum(v) / len(v) for k, v in tot.items()}
+
+
+def gamma_truth(case, gamma):
+    """The gamma-law answer for the first refresh: fresh_frac = C * r**gamma,
+    C calibrated so the fresh earns total 103 over 3,230 new players."""
+    last = case["history"][-1]
+    rates = last["rates"]
+    n_old, n_new = 638.0, 3868.0
+    dn = n_new - n_old
+    denom = sum((r ** (1.0 + gamma)) for r in rates if r < 99.9)
+    c_frac = (103.0 * 100.0 / dn / denom) if denom > 0 else 0.0
+    out = []
+    for r in rates:
+        if r >= 99.9:
+            out.append(100.0)
+        else:
+            e_old = r * n_old / 100.0
+            e_new = c_frac * (r ** gamma) * r * dn / 100.0 if r > 0 else 0.0
+            out.append(100.0 * (e_old + e_new) / n_new)
+    return out
+
+
+def identify_flat_prior():
+    """Identify the flat prior from the v1 entry's REAL practice grade
+    (loss 0.174689, typical miss 0.05, coverage 0.927273): score the v1
+    flat forecast against gamma-law truths with different total fresh
+    earns, and find the total whose loss and miss match the server's.
+    Also scans concentration gamma at the old 103-earn anchor."""
+    print("\n=== FLAT-PRIOR IDENTIFICATION (real v1 grade: loss 0.174689,"
+          " miss 0.05, cov 0.927) ===")
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        ind, outd = td / "in", td / "out"
+        ind.mkdir()
+        outd.mkdir()
+        for f in ("p00.in", "p01.in"):
+            (ind / f).write_text((KIT / "input" / f).read_text())
+        run_main(ind, outd, {"MF_FLAT_GAMMA": "0", "MF_FLAT_SPREAD": "0.25",
+                              "MF_FRESH_EARNS_PER_NEW": str(103.0 / 3230.0)})
+        fc = []
+        for f in ("p00.in", "p01.in"):
+            case = json.loads((KIT / "input" / f).read_text())
+            fc.append((case, json.loads((outd / (Path(f).stem + ".out")).read_text())))
+
+    def stats(forecast, truth):
+        rows = {r["id"]: r["q"] for r in forecast["trophies"]}
+        tot = 0.0
+        n = 0
+        miss = 0.0
+        cov = 0
+        cnt = 0
+        for i, y in enumerate(truth):
+            q = rows[i + 1]
+            for tau, qv in zip(LEVELS, q):
+                tot += pinball(y, qv, tau)
+                n += 1
+            miss += abs(y - q[2])
+            cnt += 1
+            if q[0] <= y <= q[4]:
+                cov += 1
+        return tot / n, miss / cnt, cov / cnt
+
+    def truth_total(case, total, gamma=0.5):
+        last = case["history"][-1]
+        rates = last["rates"]
+        n_old, n_new = 638.0, 3868.0
+        dn = n_new - n_old
+        denom = sum((r ** (1.0 + gamma)) for r in rates if r < 99.9)
+        c_frac = (total * 100.0 / dn / denom) if denom > 0 else 0.0
+        out = []
+        for r in rates:
+            if r >= 99.9:
+                out.append(100.0)
+            else:
+                e_old = r * n_old / 100.0
+                e_new = c_frac * (r ** gamma) * r * dn / 100.0 if r > 0 else 0.0
+                out.append(100.0 * (e_old + e_new) / n_new)
+        return out
+
+    print("v1 forecast vs gamma-law truths, total fresh earns scanned:")
+    for total in (0, 10, 25, 50, 103):
+        ls, ms, cs = [], [], []
+        for case, mine in fc:
+            l, m, c = stats(mine, truth_total(case, total))
+            ls.append(l)
+            ms.append(m)
+            cs.append(c)
+        print(f"  total {total:<4} -> loss {sum(ls)/2:.3f} miss {sum(ms)/2:.3f} "
+              f"cov {sum(cs)/2:.3f}")
+    print("==> loss 0.174689 and miss 0.05 both point at total ~= 10"
+          " (0 -> 0.192/0.050, 10 -> 0.174/0.046, 25 -> 0.148/0.039).")
+    print("v1 forecast vs gamma-law truths at the old 103-earn anchor:")
+    for gamma in (0.0, 0.5, 1.0, 1.5, 2.0, 3.0):
+        ls = [score(mine, gamma_truth(case, gamma)) for case, mine in fc]
+        print(f"  truth gamma {gamma:<4} -> v1 loss {sum(ls)/len(ls):.3f}")
+    print("==> no gamma at 103 earns reaches 0.1747 (max 0.141 at gamma 3);"
+          " the total, not the shape, was wrong.")
+
+
+def flat_sweep():
+    print("\n=== FLAT-BRANCH GAMMA SWEEP (practice proxies, mean p00+p01) ===")
+    print("minimax = worst proxy; lower is better")
+    for gamma in (0.0, 0.5, 1.0):
+        m = practice_scores(gamma=gamma)
+        worst = max(m.values())
+        print(f"gamma {gamma:<4} " + "  ".join(f"{k.split()[0]} {v:.3f}" for k, v in m.items()) +
+              f"  worst {worst:.3f}")
+    print("=== FLAT SPREAD (gamma 0.5) ===")
+    for sp in (0.10, 0.15, 0.25):
+        m = practice_scores(gamma=0.5, flat_spread=sp)
+        print(f"spread {sp:<5} " + "  ".join(f"{k.split()[0]} {v:.3f}" for k, v in m.items()) +
+              f"  worst {max(m.values()):.3f}")
 
 
 # ---------------- synthetic final backtest ----------------
@@ -316,29 +437,25 @@ def synthetic_table(seeds=(1, 2, 3, 4, 5), weights=None, sigma=None, verbose=Tru
 
 def sweep():
     print("\n=== WEIGHT SWEEP (synthetic final, mean over 5 seeds) ===")
+    print("weights are (trend, weibull, EN)")
     combos = [
+        ("v2 default (0.6/0.25/0.15)", (0.6, 0.25, 0.15)),
         ("trend only", (1, 0, 0)),
-        ("weibull only", (0, 1, 0)),
-        ("EN only", (0, 0, 1)),
-        ("trend .5 / weib .5", (0.5, 0.5, 0)),
         ("trend .7 / weib .3", (0.7, 0.3, 0)),
-        ("trend .3 / weib .7", (0.3, 0.7, 0)),
+        ("trend .5 / weib .5", (0.5, 0.5, 0)),
         ("trend .4 / weib .3 / EN .3", (0.4, 0.3, 0.3)),
         ("equal thirds", (1 / 3, 1 / 3, 1 / 3)),
-        ("trend .25 / weib .5 / EN .25", (0.25, 0.5, 0.25)),
-        ("trend .2 / weib .5 / EN .3", (0.2, 0.5, 0.3)),
-        ("trend .4 / weib .4 / EN .2", (0.4, 0.4, 0.2)),
     ]
     best = None
     for name, w in combos:
         m = synthetic_table(weights=w, verbose=False)
-        print(f"{name:<28} mine {m['mine']:.3f}  (persist {m['persist']:.3f} curve {m['curve']:.3f})")
+        print(f"{name:<36} mine {m['mine']:.3f}  (persist {m['persist']:.3f} curve {m['curve']:.3f})")
         if best is None or m["mine"] < best[1]:
             best = (name, m["mine"], w)
     print(f"BEST: {best[0]} {best[1]:.3f} weights={best[2]}")
     print("\n=== SPREAD SWEEP on best weights ===")
     best_sigma = None
-    for sigma in (0.15, 0.20, 0.25, 0.30):
+    for sigma in (0.10, 0.15, 0.20, 0.25):
         m = synthetic_table(weights=best[2], sigma=sigma, verbose=False)
         print(f"HORIZON_SIGMA {sigma:<5} mine {m['mine']:.3f}")
         if best_sigma is None or m["mine"] < best_sigma[1]:
@@ -358,6 +475,12 @@ if __name__ == "__main__":
     mean_ex = sum(ex) / len(ex)
     assert abs(mean_ex - 0.403404) < 1e-6, f"scorer mismatch: {mean_ex}"
     print(f"scorer OK (worked example mean {mean_ex:.6f} == 0.403404)")
-    practice_table()
+    print("=== PRACTICE (p00 + p01) vs proxy answers, v2 defaults ===")
+    print("house persistence baseline scores ~1.51 on the real practice")
+    m = practice_scores()
+    for k, v in m.items():
+        print(f"  {k:<24} {v:.3f}   (worst {max(m.values()):.3f})")
+    identify_flat_prior()
+    flat_sweep()
     synthetic_table()
     sweep()

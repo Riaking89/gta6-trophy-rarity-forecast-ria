@@ -19,29 +19,42 @@ The program works from the case's history of reads:
     refresh), keeping each snapshot's first-seen time;
   - when the history is flat (one snapshot: no refresh seen yet) it forecasts
     one refresh like the launch night's first: tracked players x6.06, the
-    newly tracked players holding the ubiquitous trophy at 100% and every
-    other trophy at ~6.7% of its current rate (the split the first refresh's
-    totals imply), with a wide spread because a refresh may or may not land;
+    newly tracked players holding the ubiquitous trophy at 100% and the other
+    trophies at a fresh fraction that grows with the trophy's old rate
+    (fresh_frac ~ sqrt(rate): a new cohort reaches easy trophies far sooner
+    than hard ones), calibrated so the fresh earns total ~10 over 3,230 new
+    players, the number the v1 entry's real practice grade identifies (see
+    below); the spread is 0.15 logit, tightened from 0.25 after the real
+    practice grade showed 90% coverage of 0.927 (too wide) with a typical
+    miss of only 0.05 points;
   - when the history has real refreshes the median blends three components
     in logit space (weights 0.6 / 0.25 / 0.15): a logit-trend fit over the
     last 24 hours of snapshots (the house curve baseline's shape, fitted on
     refresh points only); a saturating Weibull rate curve per trophy, which
     cannot run away the way a power law does; and an earn-count model that
     fits E(t) with a saturating curve and N(t) with a power law, taking the
-    rate as E/N, so dilution is in the forecast by construction. The spread
-    comes from the trend fits' residuals per tier plus a term that grows
-    with the square root of the horizon in days.
+    rate as E/N, so dilution is in the forecast by construction. A fourth
+    component was tried in v2 and removed: a count-consistent refresh-step
+    model (step the measured per-refresh N growth and fresh-cohort holdings
+    forward) scored far worse on the synthetic final at every weight
+    (0.27 at weight 0.25, 0.15 at 0.10, 0.13 at 0.05, against 0.125 with
+    it off), because it attributes all new earns to the new cohort while
+    the old players keep earning as they age, and compounds a constant
+    growth factor where growth decays. The spread comes from the trend
+    fits' residuals per tier plus a term that grows with the square root
+    of the horizon in days (0.15 logit per root-day).
 
 Weights and spread were tuned on a synthetic launch-week backtest (a
 cohort simulation with power-law player growth and refresh freezes): the
-blend scores ~0.14 mean pinball loss there, against ~0.28 for the house
+blend scores ~0.13 mean pinball loss there, against ~0.28 for the house
 curve baseline and ~0.39 for persistence. That is a synthetic result, not
-a promise about the real final; on the real practice cases the flat-history
-prior scores ~0.10-0.19 against three proxy answers for the first refresh,
-against ~1.4-1.7 for the baselines. The flat-history spread (0.25 logit) is
-the honest middle: it is the best worst case across the three proxies, and
-it still admits that a refresh may land small, large, or not at all inside
-a short window.
+a promise about the real final. The v1 entry scored 0.174689 on the real
+practice (rank ~901 of 4,900 scored; top-20 cutoff 0.0492) with coverage
+0.927 and a typical miss of 0.05 points: the practice is one refresh over
+90 minutes and, as the rules warn, little guide to the final's week, but
+its three numbers identify the flat prior's fresh earns at ~10, not 103,
+which v2 uses. The final is decided on the refresh-branch forecast, not
+the flat prior.
 
 Output: /output/<id>.out, {"trophies": [{"id": n, "q": [q05, q25, q50, q75,
 q95]}]}, one row per trophy, quantiles non-decreasing in [0, 100], rounded
@@ -65,11 +78,17 @@ Z = [-1.645, -0.674, 0, 0.674, 1.645]
 RELEASE = datetime(2026, 11, 19, 0, 0, 0, tzinfo=timezone.utc)
 
 # First refresh on launch night: 638 -> 3,868 tracked players (x6.06). The
-# newly tracked players held the ubiquitous trophy at 100% and the other 54
-# trophies at ~6.7% of their old rate (103 fresh earns over 54 trophies
-# against 3,230 new players). These are the flat-history prior's constants.
+# newly tracked players held the ubiquitous trophy at 100% and earned only
+# ~10 trophies across the other 54 in the first hours: that number is not
+# assumed, it is identified from the v1 entry's real practice grade (loss
+# 0.174689, typical miss 0.05 points), which the 103-earn uniform prior
+# cannot reproduce (it predicts loss ~0.10 and miss ~0.00). The fresh
+# fraction grows with the trophy's old rate as fresh_frac = C * rate**0.5
+# (a new cohort reaches easy trophies far sooner than hard ones), with C
+# set so the fresh earns total FRESH_EARNS_PER_NEW per new player.
 FIRST_REFRESH_GROWTH = 6.06
-NEW_COHORT_RATE_FRAC = 0.067
+FRESH_EARNS_PER_NEW = float(
+    os.environ.get("MF_FRESH_EARNS_PER_NEW", str(10.0 / 3230.0)))
 
 # Blend weights of the three median components (logit space). Tuned on a
 # synthetic launch-week backtest (see README). The environment overrides
@@ -81,8 +100,9 @@ W_EN = float(os.environ.get("MF_W_EN", "0.15"))
 # Spread: residual floor per tier, and the horizon term's logit sd per
 # square-root day. HORIZON_SIGMA is tunable from the environment locally.
 RESID_FLOOR = 0.30
-HORIZON_SIGMA = float(os.environ.get("MF_HORIZON_SIGMA", "0.20"))
-FLAT_SPREAD = float(os.environ.get("MF_FLAT_SPREAD", "0.25"))
+HORIZON_SIGMA = float(os.environ.get("MF_HORIZON_SIGMA", "0.15"))
+FLAT_SPREAD = float(os.environ.get("MF_FLAT_SPREAD", "0.15"))
+FLAT_GAMMA = float(os.environ.get("MF_FLAT_GAMMA", "0.5"))
 SPREAD_CAP = 2.0
 
 # Time shift (hours) in the saturating fits: the page already showed earned
@@ -175,10 +195,18 @@ def forecast_flat(case, snaps, horizon_days):
 
     N multiplies by FIRST_REFRESH_GROWTH; the ubiquitous trophy (100%) stays
     100% because every newly tracked player holds it; every other trophy's
-    new holders earn it at NEW_COHORT_RATE_FRAC of its current rate.
+    new holders earn it at a fresh fraction that grows with its current
+    rate (a new cohort reaches easy trophies sooner), calibrated so the
+    fresh earns total FRESH_EARNS_PER_NEW per new player.
     """
     _, n_last, rates = snaps[-1]
     n_new = n_last * FIRST_REFRESH_GROWTH
+    dn = n_new - n_last
+    # Calibrate C so sum_i fresh_frac_i * r_i * dn / 100 == fresh total.
+    total_fresh = FRESH_EARNS_PER_NEW * dn
+    denom = sum((r ** (1.0 + FLAT_GAMMA)) for r in rates
+                if r is not None and r < 99.9)
+    c_frac = (total_fresh * 100.0 / dn / denom) if denom > 0 else 0.0
     spread = min(SPREAD_CAP, FLAT_SPREAD + 0.15 * math.sqrt(horizon_days))
     rows = []
     for i, trophy in enumerate(case["trophies"]):
@@ -190,7 +218,8 @@ def forecast_flat(case, snaps, horizon_days):
             sp = 0.15
         else:
             e_old = r * n_last / 100.0
-            e_new = NEW_COHORT_RATE_FRAC * r * (n_new - n_last) / 100.0
+            frac = c_frac * (r ** FLAT_GAMMA) if r > 0 else 0.0
+            e_new = frac * r * dn / 100.0
             med = clamp_pct(100.0 * (e_old + e_new) / n_new)
             sp = spread
         rows.append({"id": trophy["id"], "q": quantiles(med, sp)})
